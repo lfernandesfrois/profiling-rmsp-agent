@@ -6,3 +6,5 @@ __pycache__/
 .venv/
 build/
 dist/
+*_deep_profile_artifacts/
+*.etl

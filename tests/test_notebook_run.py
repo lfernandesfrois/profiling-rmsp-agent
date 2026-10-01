@@ -1,8 +1,10 @@
 import contextlib
 import importlib.util
+import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import nbformat
 
@@ -114,6 +116,61 @@ class NotebookRunIntegrationTests(unittest.TestCase):
         self.assertIsNone(result.failed_cell)
         self.assertEqual(result.source_cell_indices[2], 2)
         self.assertEqual(result.source_cell_indices[3], 4)
+
+    def test_rmsp_path_is_available_only_in_kernel_and_preserves_cell_numbers(self) -> None:
+        package_parent = self.directory / "extra packages"
+        package = package_parent / "rmsp"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("ORIGIN = 'temporary'\n", encoding="utf-8")
+        input_path = self._write_notebook(
+            "rmsp_demo.ipynb",
+            ["import rmsp\nassert rmsp.ORIGIN == 'temporary'", "answer = 42"],
+        )
+        instrumented = create_instrumented_notebook(input_path)
+        original_environment = os.environ.copy()
+
+        result = run_notebook(instrumented.output_path, rmsp_path=package_parent)
+
+        self.assertIsNone(result.failed_cell)
+        self.assertEqual([cell["cell_number"] for cell in result.cells], [2, 3])
+        self.assertEqual(result.source_cell_indices[2], 1)
+        self.assertEqual(os.environ, original_environment)
+        self.assertNotIn(str(package_parent), input_path.read_text(encoding="utf-8"))
+        self.assertNotIn(str(package_parent), instrumented.output_path.read_text(encoding="utf-8"))
+
+    def test_failed_run_does_not_change_parent_environment(self) -> None:
+        package_parent = self.directory / "libs"
+        package = package_parent / "rmsp"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("ORIGIN = 'temporary'\n", encoding="utf-8")
+        input_path = self._write_notebook(
+            "rmsp_error.ipynb", ["import rmsp", "raise ValueError('boom')"]
+        )
+        instrumented = create_instrumented_notebook(input_path)
+        original_environment = os.environ.copy()
+
+        result = run_notebook(instrumented.output_path, rmsp_path=package_parent)
+
+        self.assertEqual(result.failed_cell.ename, "ValueError")
+        self.assertEqual(os.environ, original_environment)
+
+
+class KernelEnvironmentTests(unittest.TestCase):
+    def test_existing_pythonpath_is_preserved_and_not_duplicated(self) -> None:
+        from profiling_rmsp_agent.notebook_run import _kernel_setup_options
+
+        directory = Path("C:/libraries")
+        with patch.dict(os.environ, {"PYTHONPATH": os.pathsep.join(["other", str(directory)])}):
+            original = os.environ.copy()
+            options = _kernel_setup_options(directory)
+            self.assertEqual(options["env"]["PYTHONPATH"], original["PYTHONPATH"])
+            self.assertEqual(os.environ, original)
+
+        with patch.dict(os.environ, {"PYTHONPATH": "other"}):
+            options = _kernel_setup_options(directory)
+            self.assertEqual(
+                options["env"]["PYTHONPATH"], os.pathsep.join([str(directory), "other"])
+            )
 
 
 if __name__ == "__main__":

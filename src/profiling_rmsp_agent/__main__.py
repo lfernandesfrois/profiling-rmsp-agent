@@ -10,12 +10,13 @@ from profiling_rmsp_agent.notebook_run import run_notebook
 from profiling_rmsp_agent.deep_profile import (
     DeepProfileConfigError,
     resolve_deep_profile_policy,
+    resolve_rmsp_path,
 )
 from profiling_rmsp_agent.deep_profile_run import run_candidate_replay
-from profiling_rmsp_agent.etw_capture import (
-    EtwCaptureError,
-    WindowsEtwProfiler,
-    resolve_etw_config,
+from profiling_rmsp_agent.vtune_capture import (
+    VtuneCaptureError,
+    WindowsVtuneProfiler,
+    resolve_vtune_config,
 )
 from profiling_rmsp_agent.report import build_report, write_report
 
@@ -34,6 +35,11 @@ def main(arguments: Sequence[str] | None = None) -> int:
         help="JSON config file (default: profile_config.json beside the notebook)",
     )
     parser.add_argument(
+        "--rmsp-path",
+        type=Path,
+        help="parent directory of the rmsp package, added only to notebook kernels",
+    )
+    parser.add_argument(
         "--min-total-time-seconds",
         type=float,
         help="candidate minimum total cell time; overrides config",
@@ -47,8 +53,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
         "--capture-deep-profile",
         action="store_true",
         help=(
-            "replay the notebook in a fresh kernel and capture candidate cells with WPR/WPA; "
-            "cells execute a second time"
+            "replay the notebook in a fresh kernel and attach Intel VTune Profiler by PID to "
+            "candidate cells; cells execute a second time"
         ),
     )
     parsed = parser.parse_args(arguments)
@@ -60,16 +66,17 @@ def main(arguments: Sequence[str] | None = None) -> int:
             cli_min_total_time_seconds=parsed.min_total_time_seconds,
             cli_min_native_python_ratio=parsed.min_native_python_ratio,
         )
+        rmsp_path = resolve_rmsp_path(parsed.notebook, parsed.config, parsed.rmsp_path)
     except DeepProfileConfigError as error:
         parser.error(str(error))
 
-    etw_profiler = None
+    vtune_profiler = None
     if parsed.capture_deep_profile:
         try:
-            etw_config = resolve_etw_config(parsed.notebook, parsed.config)
-            etw_profiler = WindowsEtwProfiler(etw_config)
-            etw_profiler.preflight()
-        except EtwCaptureError as error:
+            vtune_config = resolve_vtune_config(parsed.notebook, parsed.config)
+            vtune_profiler = WindowsVtuneProfiler(vtune_config)
+            vtune_profiler.preflight()
+        except VtuneCaptureError as error:
             parser.error(str(error))
 
     try:
@@ -78,7 +85,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         parser.error(str(error))
 
     print(f"Created {instrumented.output_path}")
-    result = run_notebook(instrumented.output_path)
+    result = run_notebook(instrumented.output_path, rmsp_path=rmsp_path)
 
     report_path = instrumented.output_path.with_suffix(".json")
     report = build_report(
@@ -91,7 +98,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     write_report(report, report_path)
 
     deep_profile_failed = False
-    if etw_profiler is not None:
+    if vtune_profiler is not None:
         candidates = [
             cell for cell in report["cells"] if cell["deep_profile_candidate"]
         ]
@@ -106,7 +113,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 parsed.notebook,
                 candidates,
                 source_cell_indices,
-                etw_profiler,
+                vtune_profiler,
+                rmsp_path=rmsp_path,
             )
             report["deep_profile"] = deep_result.to_dict()
             deep_profile_failed = deep_result.status in {
@@ -119,11 +127,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 "summary": {
                     "candidate_count": 0,
                     "captured_count": 0,
-                    "exported_count": 0,
                     "capture_failed_count": 0,
-                    "export_failed_count": 0,
                     "not_reached_count": 0,
-                    "total_sampled_cpu_time_seconds": 0.0,
                 },
                 "failed_cell": None,
                 "error": None,
@@ -141,7 +146,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return 1
 
     if deep_profile_failed:
-        print("Deep-profile capture or export completed with errors.", file=sys.stderr)
+        print("Deep-profile capture completed with errors.", file=sys.stderr)
         return 1
 
     print(f"Profiled {len(result.cells)} cell(s) successfully.")

@@ -3,6 +3,7 @@ import io
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -12,6 +13,7 @@ from profiling_rmsp_agent.deep_profile import (
     DeepProfileConfigError,
     DeepProfilePolicy,
     resolve_deep_profile_policy,
+    resolve_rmsp_path,
 )
 
 
@@ -215,6 +217,102 @@ class ResolveDeepProfilePolicyTests(unittest.TestCase):
         create.assert_not_called()
         run.assert_not_called()
         self.assertIn("thresholds are required", stderr.getvalue())
+
+
+class ResolveRmspPathTests(unittest.TestCase):
+    def test_missing_path_is_optional(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            notebook = Path(directory) / "analysis.ipynb"
+            self.assertIsNone(resolve_rmsp_path(notebook, None, None))
+
+    def test_config_path_is_relative_to_config_and_cli_overrides_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_dir = root / "config"
+            config_dir.mkdir()
+            package_parent = config_dir / "libs"
+            package_parent.mkdir()
+            override = root / "override"
+            override.mkdir()
+            config = config_dir / "profile.json"
+            config.write_text(json.dumps({"rmsp_path": "libs"}), encoding="utf-8")
+            notebook = root / "analysis.ipynb"
+
+            self.assertEqual(resolve_rmsp_path(notebook, config, None), package_parent)
+            self.assertEqual(resolve_rmsp_path(notebook, config, override), override)
+
+    def test_invalid_path_and_explicit_missing_config_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            notebook = root / "analysis.ipynb"
+            config = root / DEFAULT_CONFIG_NAME
+            for value in ("", None, 42, "missing"):
+                with self.subTest(value=value):
+                    config.write_text(json.dumps({"rmsp_path": value}), encoding="utf-8")
+                    with self.assertRaisesRegex(DeepProfileConfigError, "rmsp_path"):
+                        resolve_rmsp_path(notebook, None, None)
+            with self.assertRaisesRegex(DeepProfileConfigError, "Could not read config"):
+                resolve_rmsp_path(notebook, root / "missing.json", root)
+
+    def test_cli_passes_configured_path_to_first_kernel(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / DEFAULT_CONFIG_NAME
+            config.write_text(json.dumps({
+                "min_total_time_seconds": 1,
+                "min_native_python_ratio": 1,
+                "rmsp_path": ".",
+            }), encoding="utf-8")
+            instrumented = SimpleNamespace(output_path=root / "analysis_profile.ipynb")
+            run_result = SimpleNamespace(cells=[], failed_cell=None, source_cell_indices={})
+            with (
+                patch("profiling_rmsp_agent.__main__.create_instrumented_notebook", return_value=instrumented),
+                patch("profiling_rmsp_agent.__main__.run_notebook", return_value=run_result) as run,
+                patch("profiling_rmsp_agent.__main__.write_report"),
+            ):
+                status = main([str(root / "analysis.ipynb")])
+
+            self.assertEqual(status, 0)
+            run.assert_called_once_with(instrumented.output_path, rmsp_path=root)
+
+    def test_cli_override_is_passed_to_both_kernels(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            override = root / "override"
+            override.mkdir()
+            config = root / DEFAULT_CONFIG_NAME
+            config.write_text(json.dumps({
+                "min_total_time_seconds": 1,
+                "min_native_python_ratio": 1,
+                "rmsp_path": ".",
+            }), encoding="utf-8")
+            instrumented = SimpleNamespace(
+                output_path=root / "analysis_profile.ipynb", load_ext_cell_inserted=True
+            )
+            run_result = SimpleNamespace(
+                cells=[{"cell_number": 2, "total_time_seconds": 2,
+                        "native_time_seconds": 2, "python_time_seconds": 0}],
+                failed_cell=None,
+                source_cell_indices={2: 1},
+            )
+            deep_result = SimpleNamespace(status="completed", to_dict=lambda: {"status": "completed"})
+            with (
+                patch("profiling_rmsp_agent.__main__.create_instrumented_notebook", return_value=instrumented),
+                patch("profiling_rmsp_agent.__main__.run_notebook", return_value=run_result) as run,
+                patch("profiling_rmsp_agent.__main__.WindowsVtuneProfiler") as profiler,
+                patch("profiling_rmsp_agent.__main__.run_candidate_replay", return_value=deep_result) as replay,
+                patch("profiling_rmsp_agent.__main__.write_report"),
+            ):
+                status = main([
+                    str(root / "analysis.ipynb"), "--rmsp-path", str(override),
+                    "--capture-deep-profile",
+                ])
+
+            self.assertEqual(status, 0)
+            run.assert_called_once_with(instrumented.output_path, rmsp_path=override)
+            self.assertEqual(replay.call_args.kwargs["rmsp_path"], override)
+            self.assertEqual(replay.call_args.args[2], {2: 0})
+            profiler.return_value.preflight.assert_called_once()
 
 
 if __name__ == "__main__":

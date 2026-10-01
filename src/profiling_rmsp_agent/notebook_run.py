@@ -2,6 +2,7 @@
 
 import ast
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,18 @@ class NotebookRunResult:
     cells: list[dict[str, Any]]
     failed_cell: FailedCell | None
     source_cell_indices: dict[int, int]
+
+
+def _kernel_setup_options(rmsp_path: Path | None) -> dict[str, Any]:
+    if rmsp_path is None:
+        return {}
+    environment = os.environ.copy()
+    existing = environment.get("PYTHONPATH", "")
+    paths = existing.split(os.pathsep) if existing else []
+    directory = str(rmsp_path)
+    if not any(os.path.normcase(os.path.normpath(path)) == os.path.normcase(os.path.normpath(directory)) for path in paths):
+        environment["PYTHONPATH"] = os.pathsep.join([directory, *paths])
+    return {"env": environment}
 
 
 def _extract_to_dicts_result(executed_cell: Any) -> list[dict[str, Any]]:
@@ -41,7 +54,9 @@ def _fetch_partial_results(
         return []
 
 
-def run_notebook(notebook_path: str | Path) -> NotebookRunResult:
+def run_notebook(
+    notebook_path: str | Path, rmsp_path: Path | None = None
+) -> NotebookRunResult:
     """Execute every cell of *notebook_path* and return the collected timings."""
     path = Path(notebook_path)
     notebook = nbformat.read(path, as_version=4)
@@ -49,7 +64,7 @@ def run_notebook(notebook_path: str | Path) -> NotebookRunResult:
     client = NotebookClient(notebook, timeout=None)
     source_cell_indices: dict[int, int] = {}
     code_cell_number = 0
-    with client.setup_kernel():
+    with client.setup_kernel(**_kernel_setup_options(rmsp_path)):
         executed = None
         for index, cell in enumerate(notebook.cells):
             if cell.cell_type != "code":

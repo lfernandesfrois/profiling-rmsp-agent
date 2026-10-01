@@ -68,56 +68,91 @@ python -m profiling_rmsp_agent path\to\notebook.ipynb `
 If either threshold is still missing after loading the file and applying CLI
 overrides, the command stops before creating or executing the profiled notebook.
 
-### ETW deep capture (Windows)
+### Importing rmsp during profiling
 
-Deep capture is opt-in because it replays the notebook in a fresh kernel after
-the timing pass. Earlier cells run again to reconstruct state; file writes,
-database updates, network requests, prompts, and other side effects can repeat.
-Only cells marked `deep_profile_candidate` receive an active WPR capture, but
-all preceding code cells execute during replay.
-
-Install Windows Performance Toolkit (WPT), then create a WPA export profile in
-WPA with the **CPU Usage (Sampled) by Process, Thread** table and save it as a
-`.wpaProfile`. WPAExporter requires this profile; there is no generic
-export-everything mode. The exported CSV filename and column headers are
-specific to that profile/WPT version, so inspect an export and copy its actual
-filename and headers into the config.
-
-Add an `etw` section to `profile_config.json` beside the notebook (paths can be
-absolute or relative to the config file):
+If `rmsp` is not installed in the notebook kernel, set `rmsp_path` to the
+**parent** directory containing the `rmsp` package (for example, use `C:/libs`
+when the package is in `C:/libs/rmsp`). You can set it in the same JSON file:
 
 ```json
 {
    "min_total_time_seconds": 1.0,
    "min_native_python_ratio": 1.0,
-   "etw": {
-      "wpr_profile": "profiles/CPU.wprp!CPUProfile.Verbose",
-      "wpa_export_profile": "C:/path/to/CPU-Sampled.wpaProfile",
+   "rmsp_path": "C:/libs"
+}
+```
+
+Or override it for one run with `--rmsp-path`:
+
+```powershell
+python -m profiling_rmsp_agent path\to\notebook.ipynb `
+   --rmsp-path C:\libs `
+   --min-total-time-seconds 1.0 `
+   --min-native-python-ratio 1.0
+```
+
+Relative JSON paths are resolved from the config file's directory; relative
+CLI paths are resolved from the current working directory. The directory is
+added to the kernel's Python import path for the timing pass and any optional
+VTune replay. Each kernel shuts down after execution, so the path does not
+persist in the CLI environment or the generated notebook. This does not change
+the Windows DLL search path.
+
+### VTune deep capture (Windows)
+
+Deep capture is opt-in because it replays the notebook in a fresh kernel after
+the timing pass. Earlier cells run again to reconstruct state; file writes,
+database updates, network requests, prompts, and other side effects can repeat.
+Only cells marked `deep_profile_candidate` get an active Intel VTune Profiler
+sampling collection, attached directly to the replay kernel's PID; all
+preceding code cells execute during replay without profiling.
+
+Install Intel VTune Profiler and make sure the `vtune` command-line tool is on
+`PATH` (or point `vtune.executable` at it in the config). Hardware event-based
+sampling (the default) requires the Intel sampling driver to be installed and
+may need an elevated/admin session; if that is not available, set
+`"sampling_mode": "sw"` to use user-mode sampling instead (no driver required,
+higher overhead).
+
+The entire `vtune` config section is optional — `--capture-deep-profile` works
+with no extra configuration when the profiled DLL already carries its own debug
+symbols (it is loaded in-process by the same Python kernel being sampled). Add
+a `vtune` section to `profile_config.json` only to override defaults or point
+at extra symbol/source directories:
+
+```json
+{
+   "min_total_time_seconds": 1.0,
+   "min_native_python_ratio": 1.0,
+   "vtune": {
+      "executable": "vtune",
+      "sampling_mode": "hw",
+      "search_dirs": ["C:/path/to/dll/and/pdb"],
+      "source_search_dirs": ["C:/path/to/cpp/sources"],
       "artifact_directory": "notebook_deep_profile_artifacts",
-      "cpu_csv_pattern": "replace-with-the-exported-cpu-csv-filename.csv",
-      "process_id_column": "replace-with-the-CSV-process-id-header",
-      "thread_id_column": "replace-with-the-CSV-thread-id-header",
-      "cpu_time_column": "replace-with-the-CSV-sampled-cpu-time-header",
-      "cpu_time_unit": "ms",
-      "timeout_seconds": 120
+      "timeout_seconds": 120,
+      "start_grace_seconds": 1.0
    }
 }
 ```
 
-Run the normal timing/profile pass and request the separate ETW replay:
+Run the normal timing/profile pass and request the separate VTune replay:
 
 ```powershell
 python -m profiling_rmsp_agent path\to\notebook.ipynb --capture-deep-profile
 ```
 
-The command checks WPT, the profiles, and WPR's idle state before executing the
-notebook. It never stops a WPR recording started outside this run. Each
-candidate gets its own ETL and CSV directory under the artifact folder; the
-aggregate JSON adds a `deep_profile` section with per-cell status and file
-references plus sampled CPU totals for the kernel process. Sampled CPU time is
-an estimate from ETW samples, not cell wall-clock time or exact unsampled CPU
-time. Run WPT from an appropriately elevated prompt if the selected profile
-requires it.
+For each candidate cell, the command attaches `vtune -collect hotspots` to the
+replay kernel's PID with `-duration unlimited`, executes the cell, then issues
+`vtune -command stop` to finalize that cell's result directory (the only
+documented way to end and finalize an unlimited-duration attach collection).
+Each candidate gets its own result directory under
+`<notebook>_deep_profile_artifacts/run-<id>/cell-<n>`; the aggregate JSON adds
+a `deep_profile` section with per-cell status and result directory paths.
+Inspect a result with `vtune-gui <result_dir>` or
+`vtune -report hotspots -result-dir <result_dir>` — real DLL function names
+resolve automatically as long as the DLL's symbols (PDB) are discoverable
+(same directory as the DLL, or via `search_dirs`/`source_search_dirs`).
 
 ## Using the extension directly in a notebook
 
